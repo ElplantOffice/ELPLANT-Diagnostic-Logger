@@ -1,4 +1,5 @@
 using ELPLANT.DiagnosticLogger.Models.Config;
+using ELPLANT.DiagnosticLogger.Models.Dataset;
 using ELPLANT.DiagnosticLogger.Services.Ads;
 
 namespace ELPLANT.DiagnosticLogger;
@@ -8,15 +9,18 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly AppConfig _config;
+    private readonly DatasetBuffer _datasetBuffer;
 
     public Worker(
         ILogger<Worker> logger,
         ILoggerFactory loggerFactory,
-        AppConfig config)
+        AppConfig config,
+        DatasetBuffer datasetBuffer)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _config = config;
+        _datasetBuffer = datasetBuffer;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -67,22 +71,55 @@ public class Worker : BackgroundService
             var connected =
                 await plcManager.ConnectAsync();
 
-            if (connected)
-            {
-                _logger.LogInformation(
-                    "ADS connection test successful for PLC '{PlcName}'.",
-                    plc.Name);
-            }
-            else
+            if (!connected)
             {
                 _logger.LogWarning(
                     "ADS connection test failed for PLC '{PlcName}'.",
+                    plc.Name);
+
+                continue;
+            }
+
+            _logger.LogInformation(
+                "ADS connection test successful for PLC '{PlcName}'.",
+                plc.Name);
+
+            try
+            {
+                var machineRunning =
+                    await plcManager.ReadValueAsync<bool>(
+                        "App_Variables.g_tApp.tCond.bProductionRunning");
+
+                _logger.LogInformation(
+                    "MachineRunning = {Value}",
+                    machineRunning);
+
+                var record = new DatasetRecord
+                {
+                    Timestamp = DateTime.UtcNow,
+                    PlcName = plc.Name,
+                    ParameterName = "MachineRunning",
+                    ReadMode = "OnChange",
+                    Value = machineRunning
+                };
+
+                _datasetBuffer.Enqueue(record);
+
+                _logger.LogInformation(
+                    "Dataset buffer count = {Count}",
+                    _datasetBuffer.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to read MachineRunning from PLC '{PlcName}'.",
                     plc.Name);
             }
         }
 
         _logger.LogInformation(
-            "Initial ADS connection test completed.");
+            "Initial ADS connection and dataset test completed.");
 
         while (!stoppingToken.IsCancellationRequested)
         {

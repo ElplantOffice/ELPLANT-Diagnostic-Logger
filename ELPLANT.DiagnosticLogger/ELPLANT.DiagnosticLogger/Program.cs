@@ -1,4 +1,5 @@
 using ELPLANT.DiagnosticLogger.Models.Config;
+using ELPLANT.DiagnosticLogger.Models.Dataset;
 using Serilog;
 
 namespace ELPLANT.DiagnosticLogger;
@@ -28,6 +29,9 @@ public class Program
         builder.Logging.AddSerilog(Log.Logger);
 
         builder.Services.AddSingleton(appConfig);
+
+        builder.Services.AddSingleton<DatasetBuffer>();
+
         builder.Services.AddHostedService<Worker>();
 
         builder.Services.AddWindowsService(options =>
@@ -39,7 +43,8 @@ public class Program
 
         try
         {
-            Log.Information("Starting {ApplicationName} for system {SystemName}.",
+            Log.Information(
+                "Starting {ApplicationName} for system {SystemName}.",
                 appConfig.ApplicationName,
                 appConfig.SystemName);
 

@@ -65,6 +65,34 @@ public class PlcConnectionManager : IDisposable
         }
     }
 
+    public async Task<T?> ReadValueAsync<T>(string variableName)
+    {
+        if (_adsClient is null)
+        {
+            throw new InvalidOperationException(
+                $"PLC '{_config.Name}' is not connected.");
+        }
+
+        try
+        {
+            var result = await _adsClient.ReadValueAsync<T>(
+                variableName,
+                CancellationToken.None);
+
+            return result.Value;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to read variable '{VariableName}' from PLC '{PlcName}'.",
+                variableName,
+                _config.Name);
+
+            return default;
+        }
+    }
+
     public void Disconnect()
     {
         try
