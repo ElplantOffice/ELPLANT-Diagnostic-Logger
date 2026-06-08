@@ -20,6 +20,5 @@
     <Folder Include="Configuration\" />
     <Folder Include="Services\Retention\" />
     <Folder Include="Services\Dataset\" />
-    <Folder Include="Services\Ads\" />
   </ItemGroup>
 </Project>
