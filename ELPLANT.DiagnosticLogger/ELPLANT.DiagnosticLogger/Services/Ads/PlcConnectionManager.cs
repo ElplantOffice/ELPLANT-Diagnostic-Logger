@@ -65,6 +65,40 @@ public class PlcConnectionManager : IDisposable
         }
     }
 
+    public async Task<object?> ReadParameterValueAsync(ParameterConfig parameter)
+    {
+        if (parameter.ReadMode == ParameterReadMode.OnChange)
+        {
+            // In v1.0, OnChange parameters are treated as Boolean.
+            return await ReadValueAsync<bool>(parameter.VarAddress);
+        }
+
+        if (parameter.ReadMode == ParameterReadMode.Periodic)
+        {
+            if (string.IsNullOrWhiteSpace(parameter.VarType))
+            {
+                _logger.LogWarning(
+                    "Parameter '{ParameterName}' on PLC '{PlcName}' is Periodic but VarType is missing.",
+                    parameter.Name,
+                    _config.Name);
+
+                return null;
+            }
+
+            return await ReadValueByTypeAsync(
+                parameter.VarAddress,
+                parameter.VarType);
+        }
+
+        _logger.LogWarning(
+            "Parameter '{ParameterName}' on PLC '{PlcName}' has unsupported ReadMode '{ReadMode}'.",
+            parameter.Name,
+            _config.Name,
+            parameter.ReadMode);
+
+        return null;
+    }
+
     public async Task<T?> ReadValueAsync<T>(string variableName)
     {
         if (_adsClient is null)
@@ -91,6 +125,27 @@ public class PlcConnectionManager : IDisposable
 
             return default;
         }
+    }
+
+    private async Task<object?> ReadValueByTypeAsync(
+        string variableName,
+        string varType)
+    {
+        return varType.Trim() switch
+        {
+            "System.Boolean" => await ReadValueAsync<bool>(variableName),
+            "System.Byte" => await ReadValueAsync<byte>(variableName),
+            "System.Int16" => await ReadValueAsync<short>(variableName),
+            "System.Int32" => await ReadValueAsync<int>(variableName),
+            "System.UInt16" => await ReadValueAsync<ushort>(variableName),
+            "System.UInt32" => await ReadValueAsync<uint>(variableName),
+            "System.Single" => await ReadValueAsync<float>(variableName),
+            "System.Double" => await ReadValueAsync<double>(variableName),
+            "System.String" => await ReadValueAsync<string>(variableName),
+
+            _ => throw new NotSupportedException(
+                $"Unsupported VarType '{varType}' for PLC '{_config.Name}'.")
+        };
     }
 
     public void Disconnect()

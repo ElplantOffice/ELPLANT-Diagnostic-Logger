@@ -29,6 +29,30 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        LogStartupInformation();
+
+        var runningTasks = new List<Task>();
+
+        runningTasks.Add(
+            RunDatasetWriterLoopAsync(stoppingToken));
+
+        foreach (var plc in _config.Plcs.Where(p => p.Enabled))
+        {
+            runningTasks.Add(
+                RunPlcPeriodicLoopAsync(plc, stoppingToken));
+        }
+
+        if (runningTasks.Count == 1)
+        {
+            _logger.LogWarning(
+                "No enabled PLCs configured. Only DatasetWriter loop is running.");
+        }
+
+        await Task.WhenAll(runningTasks);
+    }
+
+    private void LogStartupInformation()
+    {
         _logger.LogInformation(
             "Application: {ApplicationName}",
             _config.ApplicationName);
@@ -51,91 +75,209 @@ public class Worker : BackgroundService
 
         foreach (var plc in _config.Plcs)
         {
-            if (!plc.Enabled)
+            _logger.LogInformation(
+                "PLC: {Name}, AMS: {AmsNetId}, Port: {Port}, Enabled: {Enabled}",
+                plc.Name,
+                plc.AmsNetId,
+                plc.Port,
+                plc.Enabled);
+
+            foreach (var parameter in plc.Parameters)
             {
                 _logger.LogInformation(
-                    "PLC '{PlcName}' is disabled. Skipping.",
-                    plc.Name);
-
-                continue;
+                    "Parameter: {Name}, Mode: {Mode}",
+                    parameter.Name,
+                    parameter.ReadMode);
             }
+        }
+    }
 
-            _logger.LogInformation(
-                "Testing ADS connection to PLC '{PlcName}'...",
+    private async Task RunPlcPeriodicLoopAsync(
+        PlcConfig plc,
+        CancellationToken stoppingToken)
+    {
+        var plcLogger =
+            _loggerFactory.CreateLogger<PlcConnectionManager>();
+
+        using var plcManager =
+            new PlcConnectionManager(
+                plc,
+                plcLogger);
+
+        _logger.LogInformation(
+            "Connecting to PLC '{PlcName}'...",
+            plc.Name);
+
+        var connected =
+            await plcManager.ConnectAsync();
+
+        if (!connected)
+        {
+            _logger.LogWarning(
+                "ADS connection failed for PLC '{PlcName}'. Periodic loop will not start.",
                 plc.Name);
 
-            var plcLogger =
-                _loggerFactory.CreateLogger<PlcConnectionManager>();
+            return;
+        }
 
-            using var plcManager =
-                new PlcConnectionManager(
-                    plc,
-                    plcLogger);
+        var periodicParameters = plc.Parameters
+            .Where(p => p.ReadMode == ParameterReadMode.Periodic)
+            .ToList();
 
-            var connected =
-                await plcManager.ConnectAsync();
+        var onChangeParameters = plc.Parameters
+            .Where(p => p.ReadMode == ParameterReadMode.OnChange)
+            .ToList();
 
-            if (!connected)
+        foreach (var parameter in onChangeParameters)
+        {
+            _logger.LogInformation(
+                "PLC '{PlcName}' parameter '{ParameterName}' is configured as OnChange. ADS notifications are not implemented yet.",
+                plc.Name,
+                parameter.Name);
+        }
+
+        if (periodicParameters.Count == 0)
+        {
+            _logger.LogInformation(
+                "PLC '{PlcName}' has no Periodic parameters.",
+                plc.Name);
+
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogWarning(
-                    "ADS connection test failed for PLC '{PlcName}'.",
-                    plc.Name);
-
-                continue;
+                await Task.Delay(1000, stoppingToken);
             }
 
-            _logger.LogInformation(
-                "ADS connection test successful for PLC '{PlcName}'.",
-                plc.Name);
+            return;
+        }
 
+        var nextReadTimes = periodicParameters.ToDictionary(
+            parameter => parameter.Name,
+            _ => DateTime.MinValue);
+
+        _logger.LogInformation(
+            "Started periodic read loop for PLC '{PlcName}' with {Count} parameter(s).",
+            plc.Name,
+            periodicParameters.Count);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var nowUtc = DateTime.UtcNow;
+
+            foreach (var parameter in periodicParameters)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                if (!nextReadTimes.TryGetValue(parameter.Name, out var nextReadTime))
+                {
+                    nextReadTime = DateTime.MinValue;
+                }
+
+                if (nowUtc < nextReadTime)
+                {
+                    continue;
+                }
+
+                await ReadPeriodicParameterAsync(
+                    plc,
+                    plcManager,
+                    parameter,
+                    stoppingToken);
+
+                var intervalMs = parameter.ReadIntervalMs ?? 1000;
+
+                if (intervalMs < 100)
+                {
+                    intervalMs = 100;
+                }
+
+                nextReadTimes[parameter.Name] =
+                    DateTime.UtcNow.AddMilliseconds(intervalMs);
+            }
+
+            await Task.Delay(50, stoppingToken);
+        }
+    }
+
+    private async Task ReadPeriodicParameterAsync(
+        PlcConfig plc,
+        PlcConnectionManager plcManager,
+        ParameterConfig parameter,
+        CancellationToken stoppingToken)
+    {
+        try
+        {
+            var value =
+                await plcManager.ReadParameterValueAsync(parameter);
+
+            var record = new DatasetRecord
+            {
+                Timestamp = DateTime.UtcNow,
+                PlcName = plc.Name,
+                ParameterName = parameter.Name,
+                ReadMode = parameter.ReadMode.ToString(),
+                Value = value
+            };
+
+            _datasetBuffer.Enqueue(record);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to read Periodic parameter '{ParameterName}' from PLC '{PlcName}'.",
+                parameter.Name,
+                plc.Name);
+        }
+
+        await Task.CompletedTask;
+    }
+
+    private async Task RunDatasetWriterLoopAsync(
+        CancellationToken stoppingToken)
+    {
+        var writeIntervalSeconds = _config.Storage.WriteIntervalSeconds;
+
+        if (writeIntervalSeconds <= 0)
+        {
+            writeIntervalSeconds = 10;
+        }
+
+        _logger.LogInformation(
+            "DatasetWriter loop started. Write interval: {Seconds} second(s).",
+            writeIntervalSeconds);
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
             try
             {
-                var machineRunning =
-                    await plcManager.ReadValueAsync<bool>(
-                        "App_Variables.g_tApp.tCond.bProductionRunning");
-
-                _logger.LogInformation(
-                    "MachineRunning = {Value}",
-                    machineRunning);
-
-                var record = new DatasetRecord
-                {
-                    Timestamp = DateTime.UtcNow,
-                    PlcName = plc.Name,
-                    ParameterName = "MachineRunning",
-                    ReadMode = "OnChange",
-                    Value = machineRunning
-                };
-
-                _datasetBuffer.Enqueue(record);
-
-                _logger.LogInformation(
-                    "Dataset buffer count before write = {Count}",
-                    _datasetBuffer.Count);
-
                 var writtenRecords =
                     await _datasetWriter.WritePendingRecordsAsync(stoppingToken);
 
-                _logger.LogInformation(
-                    "Dataset writer flushed {Count} record(s). Buffer count after write = {BufferCount}",
-                    writtenRecords,
-                    _datasetBuffer.Count);
+                if (writtenRecords > 0)
+                {
+                    _logger.LogInformation(
+                        "DatasetWriter flushed {Count} record(s). Buffer count after write = {BufferCount}",
+                        writtenRecords,
+                        _datasetBuffer.Count);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
             catch (Exception ex)
             {
                 _logger.LogError(
                     ex,
-                    "Failed to read MachineRunning from PLC '{PlcName}'.",
-                    plc.Name);
+                    "DatasetWriter loop error.");
             }
-        }
 
-        _logger.LogInformation(
-            "Initial ADS connection, read, buffer and dataset file test completed.");
-
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            await Task.Delay(10000, stoppingToken);
+            await Task.Delay(
+                TimeSpan.FromSeconds(writeIntervalSeconds),
+                stoppingToken);
         }
     }
 }
