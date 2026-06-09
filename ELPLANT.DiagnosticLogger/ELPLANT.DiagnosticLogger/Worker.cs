@@ -1,6 +1,7 @@
 using ELPLANT.DiagnosticLogger.Models.Config;
 using ELPLANT.DiagnosticLogger.Models.Dataset;
 using ELPLANT.DiagnosticLogger.Services.Ads;
+using ELPLANT.DiagnosticLogger.Services.Dataset;
 
 namespace ELPLANT.DiagnosticLogger;
 
@@ -10,17 +11,20 @@ public class Worker : BackgroundService
     private readonly ILoggerFactory _loggerFactory;
     private readonly AppConfig _config;
     private readonly DatasetBuffer _datasetBuffer;
+    private readonly DatasetWriter _datasetWriter;
 
     public Worker(
         ILogger<Worker> logger,
         ILoggerFactory loggerFactory,
         AppConfig config,
-        DatasetBuffer datasetBuffer)
+        DatasetBuffer datasetBuffer,
+        DatasetWriter datasetWriter)
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _config = config;
         _datasetBuffer = datasetBuffer;
+        _datasetWriter = datasetWriter;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -106,7 +110,15 @@ public class Worker : BackgroundService
                 _datasetBuffer.Enqueue(record);
 
                 _logger.LogInformation(
-                    "Dataset buffer count = {Count}",
+                    "Dataset buffer count before write = {Count}",
+                    _datasetBuffer.Count);
+
+                var writtenRecords =
+                    await _datasetWriter.WritePendingRecordsAsync(stoppingToken);
+
+                _logger.LogInformation(
+                    "Dataset writer flushed {Count} record(s). Buffer count after write = {BufferCount}",
+                    writtenRecords,
                     _datasetBuffer.Count);
             }
             catch (Exception ex)
@@ -119,7 +131,7 @@ public class Worker : BackgroundService
         }
 
         _logger.LogInformation(
-            "Initial ADS connection and dataset test completed.");
+            "Initial ADS connection, read, buffer and dataset file test completed.");
 
         while (!stoppingToken.IsCancellationRequested)
         {

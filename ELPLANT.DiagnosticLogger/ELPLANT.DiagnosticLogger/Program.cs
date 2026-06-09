@@ -1,5 +1,6 @@
 using ELPLANT.DiagnosticLogger.Models.Config;
 using ELPLANT.DiagnosticLogger.Models.Dataset;
+using ELPLANT.DiagnosticLogger.Services.Dataset;
 using Serilog;
 
 namespace ELPLANT.DiagnosticLogger;
@@ -29,8 +30,8 @@ public class Program
         builder.Logging.AddSerilog(Log.Logger);
 
         builder.Services.AddSingleton(appConfig);
-
         builder.Services.AddSingleton<DatasetBuffer>();
+        builder.Services.AddSingleton<DatasetWriter>();
 
         builder.Services.AddHostedService<Worker>();
 
