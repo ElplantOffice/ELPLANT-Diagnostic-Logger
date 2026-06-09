@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using TwinCAT.Ads;
 using ELPLANT.DiagnosticLogger.Models.Config;
 using ELPLANT.DiagnosticLogger.Models.Dataset;
 using ELPLANT.DiagnosticLogger.Services.Ads;
@@ -12,6 +14,9 @@ public class Worker : BackgroundService
     private readonly AppConfig _config;
     private readonly DatasetBuffer _datasetBuffer;
     private readonly DatasetWriter _datasetWriter;
+
+    private readonly ConcurrentDictionary<string, object?> _lastAcceptedValues = new();
+    private readonly ConcurrentDictionary<string, DateTime> _lastAcceptedTimesUtc = new();
 
     public Worker(
         ILogger<Worker> logger,
@@ -31,15 +36,17 @@ public class Worker : BackgroundService
     {
         LogStartupInformation();
 
-        var runningTasks = new List<Task>();
-
-        runningTasks.Add(
-            RunDatasetWriterLoopAsync(stoppingToken));
+        var runningTasks = new List<Task>
+        {
+            RunDatasetWriterLoopAsync(stoppingToken)
+        };
 
         foreach (var plc in _config.Plcs.Where(p => p.Enabled))
         {
             runningTasks.Add(
-                RunPlcPeriodicLoopAsync(plc, stoppingToken));
+                RunPlcLoopAsync(
+                    plc,
+                    stoppingToken));
         }
 
         if (runningTasks.Count == 1)
@@ -70,29 +77,49 @@ public class Worker : BackgroundService
             _config.Storage.ApplicationLogFolder);
 
         _logger.LogInformation(
+            "Write Interval: {WriteIntervalSeconds} second(s)",
+            _config.Storage.WriteIntervalSeconds);
+
+        _logger.LogInformation(
+            "ADS: ConnectTimeout={ConnectTimeoutSeconds}s, ReadTimeout={ReadTimeoutSeconds}s, ReconnectInterval={ReconnectIntervalSeconds}s",
+            _config.Ads.ConnectTimeoutSeconds,
+            _config.Ads.ReadTimeoutSeconds,
+            _config.Ads.ReconnectIntervalSeconds);
+
+        _logger.LogInformation(
+            "Acquisition: DefaultPeriodicReadInterval={DefaultPeriodicReadIntervalSeconds}s",
+            _config.Acquisition.DefaultPeriodicReadIntervalSeconds);
+
+        _logger.LogInformation(
             "Configured PLC count: {Count}",
             _config.Plcs.Count);
 
         foreach (var plc in _config.Plcs)
         {
             _logger.LogInformation(
-                "PLC: {Name}, AMS: {AmsNetId}, Port: {Port}, Enabled: {Enabled}",
+                "PLC: {Name}, AMS: {AmsNetId}, Port: {Port}, Enabled: {Enabled}, RetentionDays: {RetentionDays}",
                 plc.Name,
                 plc.AmsNetId,
                 plc.Port,
-                plc.Enabled);
+                plc.Enabled,
+                plc.RetentionDays);
 
             foreach (var parameter in plc.Parameters)
             {
                 _logger.LogInformation(
-                    "Parameter: {Name}, Mode: {Mode}",
+                    "Parameter: {Name}, Mode: {Mode}, Address: {Address}, Type: {Type}, ReadIntervalSeconds: {ReadIntervalSeconds}, Offset: {Offset}, ForceWriteIntervalSeconds: {ForceWriteIntervalSeconds}",
                     parameter.Name,
-                    parameter.ReadMode);
+                    parameter.ReadMode,
+                    parameter.VarAddress,
+                    parameter.VarType ?? "default",
+                    GetReadIntervalSeconds(parameter),
+                    parameter.Offset ?? 0,
+                    GetForceWriteIntervalSeconds(plc, parameter));
             }
         }
     }
 
-    private async Task RunPlcPeriodicLoopAsync(
+    private async Task RunPlcLoopAsync(
         PlcConfig plc,
         CancellationToken stoppingToken)
     {
@@ -104,6 +131,13 @@ public class Worker : BackgroundService
                 plc,
                 plcLogger);
 
+        plcManager.OnAdsNotificationReceived += (_, e) =>
+        {
+            HandleAdsNotification(
+                plc,
+                e);
+        };
+
         _logger.LogInformation(
             "Connecting to PLC '{PlcName}'...",
             plc.Name);
@@ -114,54 +148,124 @@ public class Worker : BackgroundService
         if (!connected)
         {
             _logger.LogWarning(
-                "ADS connection failed for PLC '{PlcName}'. Periodic loop will not start.",
+                "ADS connection failed for PLC '{PlcName}'. PLC loop will not start.",
                 plc.Name);
 
             return;
         }
 
-        var periodicParameters = plc.Parameters
-            .Where(p => p.ReadMode == ParameterReadMode.Periodic)
-            .ToList();
+        await WriteInitialSnapshotsAsync(
+            plc,
+            plcManager,
+            stoppingToken);
 
+        RegisterOnChangeNotifications(
+            plc,
+            plcManager);
+
+        await RunParameterLoopAsync(
+            plc,
+            plcManager,
+            stoppingToken);
+    }
+
+    private async Task WriteInitialSnapshotsAsync(
+        PlcConfig plc,
+        PlcConnectionManager plcManager,
+        CancellationToken stoppingToken)
+    {
+        _logger.LogInformation(
+            "Writing initial snapshots for PLC '{PlcName}'.",
+            plc.Name);
+
+        foreach (var parameter in plc.Parameters)
+        {
+            if (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            await ReadParameterAndWriteAsync(
+                plc,
+                plcManager,
+                parameter,
+                DatasetWriteReason.InitialSnapshot);
+        }
+
+        _logger.LogInformation(
+            "Initial snapshots completed for PLC '{PlcName}'.",
+            plc.Name);
+    }
+
+    private void RegisterOnChangeNotifications(
+        PlcConfig plc,
+        PlcConnectionManager plcManager)
+    {
         var onChangeParameters = plc.Parameters
             .Where(p => p.ReadMode == ParameterReadMode.OnChange)
             .ToList();
 
-        foreach (var parameter in onChangeParameters)
+        if (onChangeParameters.Count == 0)
         {
             _logger.LogInformation(
-                "PLC '{PlcName}' parameter '{ParameterName}' is configured as OnChange. ADS notifications are not implemented yet.",
-                plc.Name,
-                parameter.Name);
-        }
-
-        if (periodicParameters.Count == 0)
-        {
-            _logger.LogInformation(
-                "PLC '{PlcName}' has no Periodic parameters.",
+                "PLC '{PlcName}' has no OnChange parameters.",
                 plc.Name);
-
-            while (!stoppingToken.IsCancellationRequested)
-            {
-                await Task.Delay(1000, stoppingToken);
-            }
 
             return;
         }
 
-        var nextReadTimes = periodicParameters.ToDictionary(
-            parameter => parameter.Name,
-            _ => DateTime.MinValue);
+        foreach (var parameter in onChangeParameters)
+        {
+            try
+            {
+                plcManager.AddOnChangeNotification(parameter);
+
+                _logger.LogInformation(
+                    "OnChange notification registered for PLC '{PlcName}', parameter '{ParameterName}', type {Type}, offset {Offset}, force interval {ForceWriteIntervalSeconds} second(s).",
+                    plc.Name,
+                    parameter.Name,
+                    parameter.VarType ?? "default",
+                    parameter.Offset ?? 0,
+                    GetForceWriteIntervalSeconds(plc, parameter));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to register OnChange notification for PLC '{PlcName}', parameter '{ParameterName}'.",
+                    plc.Name,
+                    parameter.Name);
+            }
+        }
+    }
+
+    private async Task RunParameterLoopAsync(
+        PlcConfig plc,
+        PlcConnectionManager plcManager,
+        CancellationToken stoppingToken)
+    {
+        var periodicParameters = plc.Parameters
+            .Where(p => p.ReadMode == ParameterReadMode.Periodic)
+            .ToList();
+
+        var allParameters = plc.Parameters
+            .ToList();
+
+        var nowUtc = DateTime.UtcNow;
+
+        var nextPeriodicReadTimesUtc = periodicParameters.ToDictionary(
+            parameter => GetParameterKey(plc, parameter),
+            parameter => nowUtc.AddSeconds(GetReadIntervalSeconds(parameter)));
 
         _logger.LogInformation(
-            "Started periodic read loop for PLC '{PlcName}' with {Count} parameter(s).",
+            "Started parameter loop for PLC '{PlcName}'. Periodic parameters: {PeriodicCount}, total parameters with force snapshot: {TotalCount}.",
             plc.Name,
-            periodicParameters.Count);
+            periodicParameters.Count,
+            allParameters.Count);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            var nowUtc = DateTime.UtcNow;
+            nowUtc = DateTime.UtcNow;
 
             foreach (var parameter in periodicParameters)
             {
@@ -170,69 +274,426 @@ public class Worker : BackgroundService
                     return;
                 }
 
-                if (!nextReadTimes.TryGetValue(parameter.Name, out var nextReadTime))
+                var key = GetParameterKey(plc, parameter);
+
+                if (!nextPeriodicReadTimesUtc.TryGetValue(key, out var nextReadTimeUtc))
                 {
-                    nextReadTime = DateTime.MinValue;
+                    nextReadTimeUtc = nowUtc.AddSeconds(GetReadIntervalSeconds(parameter));
                 }
 
-                if (nowUtc < nextReadTime)
+                if (nowUtc >= nextReadTimeUtc)
                 {
-                    continue;
+                    await ReadParameterAndMaybeWriteAsync(
+                        plc,
+                        plcManager,
+                        parameter,
+                        DatasetWriteReason.Periodic);
+
+                    nextPeriodicReadTimesUtc[key] =
+                        DateTime.UtcNow.AddSeconds(
+                            GetReadIntervalSeconds(parameter));
+                }
+            }
+
+            foreach (var parameter in allParameters)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                {
+                    return;
                 }
 
-                await ReadPeriodicParameterAsync(
-                    plc,
-                    plcManager,
-                    parameter,
-                    stoppingToken);
-
-                var intervalMs = parameter.ReadIntervalMs ?? 1000;
-
-                if (intervalMs < 100)
+                if (IsForceWriteDue(
+                        plc,
+                        parameter,
+                        DateTime.UtcNow))
                 {
-                    intervalMs = 100;
+                    await ReadParameterAndWriteAsync(
+                        plc,
+                        plcManager,
+                        parameter,
+                        DatasetWriteReason.ForceWrite);
                 }
-
-                nextReadTimes[parameter.Name] =
-                    DateTime.UtcNow.AddMilliseconds(intervalMs);
             }
 
             await Task.Delay(50, stoppingToken);
         }
     }
 
-    private async Task ReadPeriodicParameterAsync(
+    private async Task ReadParameterAndMaybeWriteAsync(
         PlcConfig plc,
         PlcConnectionManager plcManager,
         ParameterConfig parameter,
-        CancellationToken stoppingToken)
+        DatasetWriteReason reason)
     {
         try
         {
             var value =
                 await plcManager.ReadParameterValueAsync(parameter);
 
-            var record = new DatasetRecord
+            if (!ShouldAcceptValueByOffset(plc, parameter, value))
             {
-                Timestamp = DateTime.UtcNow,
-                PlcName = plc.Name,
-                ParameterName = parameter.Name,
-                ReadMode = parameter.ReadMode.ToString(),
-                Value = value
-            };
+                return;
+            }
 
-            _datasetBuffer.Enqueue(record);
+            EnqueueDatasetRecord(
+                plc,
+                parameter,
+                value,
+                reason);
+
+            UpdateLastAcceptedValue(
+                plc,
+                parameter,
+                value);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(
                 ex,
-                "Failed to read Periodic parameter '{ParameterName}' from PLC '{PlcName}'.",
+                "Failed to read parameter '{ParameterName}' from PLC '{PlcName}'. Reason: {Reason}.",
                 parameter.Name,
+                plc.Name,
+                reason);
+        }
+    }
+
+    private async Task ReadParameterAndWriteAsync(
+        PlcConfig plc,
+        PlcConnectionManager plcManager,
+        ParameterConfig parameter,
+        DatasetWriteReason reason)
+    {
+        try
+        {
+            var value =
+                await plcManager.ReadParameterValueAsync(parameter);
+
+            EnqueueDatasetRecord(
+                plc,
+                parameter,
+                value,
+                reason);
+
+            UpdateLastAcceptedValue(
+                plc,
+                parameter,
+                value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to read parameter '{ParameterName}' from PLC '{PlcName}'. Reason: {Reason}.",
+                parameter.Name,
+                plc.Name,
+                reason);
+        }
+    }
+
+    private void HandleAdsNotification(
+        PlcConfig plc,
+        AdsNotificationExEventArgs e)
+    {
+        try
+        {
+            if (e.UserData is not ParameterConfig parameter)
+            {
+                _logger.LogWarning(
+                    "Received ADS notification from PLC '{PlcName}' but UserData is not ParameterConfig.",
+                    plc.Name);
+
+                return;
+            }
+
+            var value = e.Value;
+
+            if (!ShouldAcceptOnChangeValue(
+                    plc,
+                    parameter,
+                    value))
+            {
+                return;
+            }
+
+            EnqueueDatasetRecord(
+                plc,
+                parameter,
+                value,
+                DatasetWriteReason.OnChange);
+
+            UpdateLastAcceptedValue(
+                plc,
+                parameter,
+                value);
+
+            _logger.LogInformation(
+                "OnChange notification accepted from PLC '{PlcName}', parameter '{ParameterName}' = {Value}",
+                plc.Name,
+                parameter.Name,
+                value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to handle ADS notification from PLC '{PlcName}'.",
                 plc.Name);
         }
+    }
 
-        await Task.CompletedTask;
+    private bool ShouldAcceptOnChangeValue(
+        PlcConfig plc,
+        ParameterConfig parameter,
+        object? currentValue)
+    {
+        var key = GetParameterKey(
+            plc,
+            parameter);
+
+        if (!_lastAcceptedValues.TryGetValue(key, out var previousValue))
+        {
+            return true;
+        }
+
+        if (ValuesAreEqual(previousValue, currentValue))
+        {
+            _logger.LogDebug(
+                "OnChange notification ignored for parameter '{ParameterName}' because value did not change. Value: {Value}",
+                parameter.Name,
+                currentValue);
+
+            return false;
+        }
+
+        return ShouldAcceptValueByOffset(
+            plc,
+            parameter,
+            currentValue);
+    }
+
+    private bool ShouldAcceptValueByOffset(
+        PlcConfig plc,
+        ParameterConfig parameter,
+        object? currentValue)
+    {
+        var offset = parameter.Offset ?? 0;
+
+        if (offset <= 0)
+        {
+            return true;
+        }
+
+        var key = GetParameterKey(
+            plc,
+            parameter);
+
+        if (!TryConvertToDouble(currentValue, out var currentNumericValue))
+        {
+            return ShouldAcceptNonNumericChange(
+                key,
+                currentValue);
+        }
+
+        if (!_lastAcceptedValues.TryGetValue(key, out var previousValue))
+        {
+            return true;
+        }
+
+        if (!TryConvertToDouble(previousValue, out var previousNumericValue))
+        {
+            return true;
+        }
+
+        var difference =
+            Math.Abs(currentNumericValue - previousNumericValue);
+
+        if (difference >= offset)
+        {
+            return true;
+        }
+
+        _logger.LogDebug(
+            "Value ignored for parameter '{ParameterName}'. Difference {Difference} is smaller than offset {Offset}.",
+            parameter.Name,
+            difference,
+            offset);
+
+        return false;
+    }
+
+    private bool ShouldAcceptNonNumericChange(
+        string key,
+        object? currentValue)
+    {
+        if (!_lastAcceptedValues.TryGetValue(key, out var previousValue))
+        {
+            return true;
+        }
+
+        return !Equals(previousValue, currentValue);
+    }
+
+    private bool IsForceWriteDue(
+        PlcConfig plc,
+        ParameterConfig parameter,
+        DateTime nowUtc)
+    {
+        var key = GetParameterKey(
+            plc,
+            parameter);
+
+        if (!_lastAcceptedTimesUtc.TryGetValue(key, out var lastAcceptedTimeUtc))
+        {
+            return true;
+        }
+
+        var forceWriteIntervalSeconds =
+            GetForceWriteIntervalSeconds(
+                plc,
+                parameter);
+
+        var elapsedSeconds =
+            (nowUtc - lastAcceptedTimeUtc).TotalSeconds;
+
+        return elapsedSeconds >= forceWriteIntervalSeconds;
+    }
+
+    private static bool ValuesAreEqual(
+        object? previousValue,
+        object? currentValue)
+    {
+        if (previousValue is null && currentValue is null)
+        {
+            return true;
+        }
+
+        if (previousValue is null || currentValue is null)
+        {
+            return false;
+        }
+
+        if (TryConvertToDouble(previousValue, out var previousNumericValue) &&
+            TryConvertToDouble(currentValue, out var currentNumericValue))
+        {
+            return Math.Abs(previousNumericValue - currentNumericValue) < double.Epsilon;
+        }
+
+        return Equals(previousValue, currentValue);
+    }
+
+    private void EnqueueDatasetRecord(
+        PlcConfig plc,
+        ParameterConfig parameter,
+        object? value,
+        DatasetWriteReason reason)
+    {
+        var record = new DatasetRecord
+        {
+            PlcName = plc.Name,
+            Ts = DateTimeOffset.Now,
+            Name = parameter.Name,
+            Mode = parameter.ReadMode?.ToString() ?? string.Empty,
+            Reason = reason.ToString(),
+            V = value
+        };
+
+        _datasetBuffer.Enqueue(record);
+
+        if (reason == DatasetWriteReason.InitialSnapshot ||
+            reason == DatasetWriteReason.ForceWrite)
+        {
+            _logger.LogInformation(
+                "{Reason} enqueued for PLC '{PlcName}', parameter '{ParameterName}' = {Value}",
+                reason,
+                plc.Name,
+                parameter.Name,
+                value);
+        }
+    }
+
+    private void UpdateLastAcceptedValue(
+        PlcConfig plc,
+        ParameterConfig parameter,
+        object? value)
+    {
+        var key = GetParameterKey(
+            plc,
+            parameter);
+
+        _lastAcceptedValues[key] = value;
+        _lastAcceptedTimesUtc[key] = DateTime.UtcNow;
+    }
+
+    private static string GetParameterKey(
+        PlcConfig plc,
+        ParameterConfig parameter)
+    {
+        return $"{plc.Name}|{parameter.Name}|{parameter.VarAddress}";
+    }
+
+    private int GetReadIntervalSeconds(
+        ParameterConfig parameter)
+    {
+        if (parameter.ReadIntervalSeconds.HasValue &&
+            parameter.ReadIntervalSeconds.Value > 0)
+        {
+            return parameter.ReadIntervalSeconds.Value;
+        }
+
+        if (_config.Acquisition.DefaultPeriodicReadIntervalSeconds > 0)
+        {
+            return _config.Acquisition.DefaultPeriodicReadIntervalSeconds;
+        }
+
+        return 10;
+    }
+
+    private static int GetForceWriteIntervalSeconds(
+        PlcConfig plc,
+        ParameterConfig parameter)
+    {
+        if (parameter.ForceWriteIntervalSeconds.HasValue &&
+            parameter.ForceWriteIntervalSeconds.Value > 0)
+        {
+            return parameter.ForceWriteIntervalSeconds.Value;
+        }
+
+        return GetDefaultForceWriteIntervalSeconds(plc);
+    }
+
+    private static int GetDefaultForceWriteIntervalSeconds(
+        PlcConfig plc)
+    {
+        var retentionDays = plc.RetentionDays;
+
+        if (retentionDays <= 0)
+        {
+            retentionDays = 30;
+        }
+
+        return retentionDays * 24 * 60 * 60;
+    }
+
+    private static bool TryConvertToDouble(
+        object? value,
+        out double result)
+    {
+        result = 0;
+
+        if (value is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            result = Convert.ToDouble(value);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task RunDatasetWriterLoopAsync(
@@ -253,15 +714,18 @@ public class Worker : BackgroundService
         {
             try
             {
-                var writtenRecords =
-                    await _datasetWriter.WritePendingRecordsAsync(stoppingToken);
-
-                if (writtenRecords > 0)
+                if (_datasetBuffer.Count > 0)
                 {
-                    _logger.LogInformation(
-                        "DatasetWriter flushed {Count} record(s). Buffer count after write = {BufferCount}",
-                        writtenRecords,
-                        _datasetBuffer.Count);
+                    var writtenRecords =
+                        await _datasetWriter.WritePendingRecordsAsync(stoppingToken);
+
+                    if (writtenRecords > 0)
+                    {
+                        _logger.LogInformation(
+                            "DatasetWriter flushed {Count} record(s). Buffer count after write = {BufferCount}",
+                            writtenRecords,
+                            _datasetBuffer.Count);
+                    }
                 }
             }
             catch (OperationCanceledException)

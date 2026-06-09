@@ -7,8 +7,11 @@ public class PlcConnectionManager : IDisposable
 {
     private readonly PlcConfig _config;
     private readonly ILogger<PlcConnectionManager> _logger;
+    private readonly List<uint> _notificationHandles = [];
 
     private AdsClient? _adsClient;
+
+    public event EventHandler<AdsNotificationExEventArgs>? OnAdsNotificationReceived;
 
     public PlcConnectionState State { get; private set; }
         = PlcConnectionState.Disconnected;
@@ -33,6 +36,8 @@ public class PlcConnectionManager : IDisposable
             State = PlcConnectionState.Connecting;
 
             _adsClient = new AdsClient();
+
+            _adsClient.AdsNotificationEx += AdsClient_AdsNotificationEx;
 
             var address = new AmsAddress(
                 _config.AmsNetId,
@@ -65,29 +70,52 @@ public class PlcConnectionManager : IDisposable
         }
     }
 
-    public async Task<object?> ReadParameterValueAsync(ParameterConfig parameter)
+    public uint AddOnChangeNotification(ParameterConfig parameter)
     {
-        if (parameter.ReadMode == ParameterReadMode.OnChange)
+        if (_adsClient is null)
         {
-            // In v1.0, OnChange parameters are treated as Boolean.
-            return await ReadValueAsync<bool>(parameter.VarAddress);
+            throw new InvalidOperationException(
+                $"PLC '{_config.Name}' is not connected.");
         }
 
-        if (parameter.ReadMode == ParameterReadMode.Periodic)
+        var dotNetType = ResolveDotNetType(parameter);
+
+        var settings = new NotificationSettings(
+            AdsTransMode.OnChange,
+            cycleTime: 100,
+            maxDelay: 0);
+
+        var handle = _adsClient.AddDeviceNotificationEx(
+            parameter.VarAddress,
+            settings,
+            parameter,
+            dotNetType);
+
+        _notificationHandles.Add(handle);
+
+        _logger.LogInformation(
+            "Registered OnChange notification for PLC '{PlcName}', parameter '{ParameterName}', type {Type}, offset {Offset}, handle {Handle}.",
+            _config.Name,
+            parameter.Name,
+            dotNetType.Name,
+            parameter.Offset ?? 0,
+            handle);
+
+        return handle;
+    }
+
+    public async Task<object?> ReadParameterValueAsync(ParameterConfig parameter)
+    {
+        if (parameter.ReadMode is null)
         {
-            if (string.IsNullOrWhiteSpace(parameter.VarType))
-            {
-                _logger.LogWarning(
-                    "Parameter '{ParameterName}' on PLC '{PlcName}' is Periodic but VarType is missing.",
-                    parameter.Name,
-                    _config.Name);
+            throw new InvalidOperationException(
+                $"Parameter '{parameter.Name}' on PLC '{_config.Name}' has no ReadMode.");
+        }
 
-                return null;
-            }
-
-            return await ReadValueByTypeAsync(
-                parameter.VarAddress,
-                parameter.VarType);
+        if (parameter.ReadMode == ParameterReadMode.OnChange ||
+            parameter.ReadMode == ParameterReadMode.Periodic)
+        {
+            return await ReadValueByResolvedTypeAsync(parameter);
         }
 
         _logger.LogWarning(
@@ -127,32 +155,125 @@ public class PlcConnectionManager : IDisposable
         }
     }
 
-    private async Task<object?> ReadValueByTypeAsync(
-        string variableName,
-        string varType)
+    private async Task<object?> ReadValueByResolvedTypeAsync(ParameterConfig parameter)
     {
-        return varType.Trim() switch
+        var dotNetType = ResolveDotNetType(parameter);
+
+        if (dotNetType == typeof(bool))
         {
-            "System.Boolean" => await ReadValueAsync<bool>(variableName),
-            "System.Byte" => await ReadValueAsync<byte>(variableName),
-            "System.Int16" => await ReadValueAsync<short>(variableName),
-            "System.Int32" => await ReadValueAsync<int>(variableName),
-            "System.UInt16" => await ReadValueAsync<ushort>(variableName),
-            "System.UInt32" => await ReadValueAsync<uint>(variableName),
-            "System.Single" => await ReadValueAsync<float>(variableName),
-            "System.Double" => await ReadValueAsync<double>(variableName),
-            "System.String" => await ReadValueAsync<string>(variableName),
+            return await ReadValueAsync<bool>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(byte))
+        {
+            return await ReadValueAsync<byte>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(short))
+        {
+            return await ReadValueAsync<short>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(int))
+        {
+            return await ReadValueAsync<int>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(ushort))
+        {
+            return await ReadValueAsync<ushort>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(uint))
+        {
+            return await ReadValueAsync<uint>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(float))
+        {
+            return await ReadValueAsync<float>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(double))
+        {
+            return await ReadValueAsync<double>(parameter.VarAddress);
+        }
+
+        if (dotNetType == typeof(string))
+        {
+            return await ReadValueAsync<string>(parameter.VarAddress);
+        }
+
+        throw new NotSupportedException(
+            $"Unsupported VarType '{parameter.VarType}' for PLC '{_config.Name}'.");
+    }
+
+    private static Type ResolveDotNetType(ParameterConfig parameter)
+    {
+        var varType = parameter.VarType?.Trim();
+
+        if (string.IsNullOrWhiteSpace(varType))
+        {
+            return typeof(bool);
+        }
+
+        return varType switch
+        {
+            "System.Boolean" => typeof(bool),
+            "System.Byte" => typeof(byte),
+            "System.Int16" => typeof(short),
+            "System.Int32" => typeof(int),
+            "System.UInt16" => typeof(ushort),
+            "System.UInt32" => typeof(uint),
+            "System.Single" => typeof(float),
+            "System.Double" => typeof(double),
+            "System.String" => typeof(string),
 
             _ => throw new NotSupportedException(
-                $"Unsupported VarType '{varType}' for PLC '{_config.Name}'.")
+                $"Unsupported VarType '{varType}' for parameter '{parameter.Name}'.")
         };
+    }
+
+    private void AdsClient_AdsNotificationEx(
+        object? sender,
+        AdsNotificationExEventArgs e)
+    {
+        OnAdsNotificationReceived?.Invoke(this, e);
     }
 
     public void Disconnect()
     {
         try
         {
-            _adsClient?.Dispose();
+            if (_adsClient is not null)
+            {
+                foreach (var handle in _notificationHandles)
+                {
+                    try
+                    {
+                        _adsClient.DeleteDeviceNotification(handle);
+
+                        _logger.LogInformation(
+                            "Deleted ADS notification handle {Handle} for PLC '{PlcName}'.",
+                            handle,
+                            _config.Name);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(
+                            ex,
+                            "Failed to delete ADS notification handle {Handle} for PLC '{PlcName}'.",
+                            handle,
+                            _config.Name);
+                    }
+                }
+
+                _notificationHandles.Clear();
+
+                _adsClient.AdsNotificationEx -= AdsClient_AdsNotificationEx;
+
+                _adsClient.Dispose();
+            }
         }
         catch (Exception ex)
         {
