@@ -6,6 +6,7 @@ namespace ELPLANT.DiagnosticLogger.Services.Ads;
 public class PlcConnectionManager : IDisposable
 {
     private readonly PlcConfig _config;
+    private readonly AdsConfig _adsConfig;
     private readonly ILogger<PlcConnectionManager> _logger;
     private readonly List<uint> _notificationHandles = [];
 
@@ -23,13 +24,15 @@ public class PlcConnectionManager : IDisposable
 
     public PlcConnectionManager(
         PlcConfig config,
+        AdsConfig adsConfig,
         ILogger<PlcConnectionManager> logger)
     {
         _config = config;
+        _adsConfig = adsConfig;
         _logger = logger;
     }
 
-    public async Task<bool> ConnectAsync()
+    public async Task<bool> ConnectAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -43,9 +46,15 @@ public class PlcConnectionManager : IDisposable
                 _config.AmsNetId,
                 _config.Port);
 
+            using var timeoutCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            timeoutCts.CancelAfter(
+                TimeSpan.FromSeconds(_adsConfig.ConnectTimeoutSeconds));
+
             await _adsClient.ConnectAsync(
                 address,
-                CancellationToken.None);
+                timeoutCts.Token);
 
             State = PlcConnectionState.Connected;
 
@@ -57,6 +66,19 @@ public class PlcConnectionManager : IDisposable
 
             return true;
         }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            State = PlcConnectionState.Disconnected;
+
+            _logger.LogWarning(
+                "PLC '{PlcName}' connection timeout after {TimeoutSeconds} second(s).",
+                _config.Name,
+                _adsConfig.ConnectTimeoutSeconds);
+
+            Disconnect();
+
+            return false;
+        }
         catch (Exception ex)
         {
             State = PlcConnectionState.Disconnected;
@@ -66,6 +88,8 @@ public class PlcConnectionManager : IDisposable
                 "PLC '{PlcName}' connection failed.",
                 _config.Name);
 
+            Disconnect();
+
             return false;
         }
     }
@@ -74,6 +98,8 @@ public class PlcConnectionManager : IDisposable
     {
         if (_adsClient is null)
         {
+            State = PlcConnectionState.Disconnected;
+
             throw new InvalidOperationException(
                 $"PLC '{_config.Name}' is not connected.");
         }
@@ -104,7 +130,9 @@ public class PlcConnectionManager : IDisposable
         return handle;
     }
 
-    public async Task<object?> ReadParameterValueAsync(ParameterConfig parameter)
+    public async Task<object?> ReadParameterValueAsync(
+        ParameterConfig parameter,
+        CancellationToken cancellationToken)
     {
         if (parameter.ReadMode is null)
         {
@@ -115,93 +143,130 @@ public class PlcConnectionManager : IDisposable
         if (parameter.ReadMode == ParameterReadMode.OnChange ||
             parameter.ReadMode == ParameterReadMode.Periodic)
         {
-            return await ReadValueByResolvedTypeAsync(parameter);
+            return await ReadValueByResolvedTypeAsync(
+                parameter,
+                cancellationToken);
         }
 
-        _logger.LogWarning(
-            "Parameter '{ParameterName}' on PLC '{PlcName}' has unsupported ReadMode '{ReadMode}'.",
-            parameter.Name,
-            _config.Name,
-            parameter.ReadMode);
-
-        return null;
+        throw new NotSupportedException(
+            $"Parameter '{parameter.Name}' on PLC '{_config.Name}' has unsupported ReadMode '{parameter.ReadMode}'.");
     }
 
-    public async Task<T?> ReadValueAsync<T>(string variableName)
+    public async Task<T> ReadValueAsync<T>(
+        string variableName,
+        CancellationToken cancellationToken)
     {
         if (_adsClient is null)
         {
+            State = PlcConnectionState.Disconnected;
+
             throw new InvalidOperationException(
                 $"PLC '{_config.Name}' is not connected.");
         }
 
         try
         {
+            using var timeoutCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            timeoutCts.CancelAfter(
+                TimeSpan.FromSeconds(_adsConfig.ReadTimeoutSeconds));
+
             var result = await _adsClient.ReadValueAsync<T>(
                 variableName,
-                CancellationToken.None);
+                timeoutCts.Token);
+
+            if (!result.Succeeded)
+            {
+                State = PlcConnectionState.Disconnected;
+
+                throw new InvalidOperationException(
+                    $"ADS read failed. PLC='{_config.Name}', Variable='{variableName}', ErrorCode='{result.ErrorCode}'.");
+            }
 
             return result.Value;
         }
-        catch (Exception ex)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            _logger.LogWarning(
-                ex,
-                "Failed to read variable '{VariableName}' from PLC '{PlcName}'.",
-                variableName,
-                _config.Name);
+            State = PlcConnectionState.Disconnected;
 
-            return default;
+            throw new TimeoutException(
+                $"ADS read timeout after {_adsConfig.ReadTimeoutSeconds} second(s). PLC='{_config.Name}', Variable='{variableName}'.");
+        }
+        catch
+        {
+            State = PlcConnectionState.Disconnected;
+            throw;
         }
     }
 
-    private async Task<object?> ReadValueByResolvedTypeAsync(ParameterConfig parameter)
+    private async Task<object?> ReadValueByResolvedTypeAsync(
+        ParameterConfig parameter,
+        CancellationToken cancellationToken)
     {
         var dotNetType = ResolveDotNetType(parameter);
 
         if (dotNetType == typeof(bool))
         {
-            return await ReadValueAsync<bool>(parameter.VarAddress);
+            return await ReadValueAsync<bool>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(byte))
         {
-            return await ReadValueAsync<byte>(parameter.VarAddress);
+            return await ReadValueAsync<byte>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(short))
         {
-            return await ReadValueAsync<short>(parameter.VarAddress);
+            return await ReadValueAsync<short>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(int))
         {
-            return await ReadValueAsync<int>(parameter.VarAddress);
+            return await ReadValueAsync<int>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(ushort))
         {
-            return await ReadValueAsync<ushort>(parameter.VarAddress);
+            return await ReadValueAsync<ushort>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(uint))
         {
-            return await ReadValueAsync<uint>(parameter.VarAddress);
+            return await ReadValueAsync<uint>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(float))
         {
-            return await ReadValueAsync<float>(parameter.VarAddress);
+            return await ReadValueAsync<float>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(double))
         {
-            return await ReadValueAsync<double>(parameter.VarAddress);
+            return await ReadValueAsync<double>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         if (dotNetType == typeof(string))
         {
-            return await ReadValueAsync<string>(parameter.VarAddress);
+            return await ReadValueAsync<string>(
+                parameter.VarAddress,
+                cancellationToken);
         }
 
         throw new NotSupportedException(
