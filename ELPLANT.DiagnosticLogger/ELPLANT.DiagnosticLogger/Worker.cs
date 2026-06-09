@@ -1,3 +1,4 @@
+using ELPLANT.DiagnosticLogger.Services.Retention;
 using System.Collections.Concurrent;
 using TwinCAT.Ads;
 using ELPLANT.DiagnosticLogger.Models.Config;
@@ -17,23 +18,27 @@ public class Worker : BackgroundService
     private readonly AppConfig _config;
     private readonly DatasetBuffer _datasetBuffer;
     private readonly DatasetWriter _datasetWriter;
+    private readonly DatasetRetentionService _retentionService;
 
     private readonly ConcurrentDictionary<string, object?> _lastAcceptedValues = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastAcceptedTimesUtc = new();
     private readonly ConcurrentDictionary<string, bool> _connectionLostState = new();
 
     public Worker(
-        ILogger<Worker> logger,
-        ILoggerFactory loggerFactory,
-        AppConfig config,
-        DatasetBuffer datasetBuffer,
-        DatasetWriter datasetWriter)
+    ILogger<Worker> logger,
+    ILoggerFactory loggerFactory,
+    AppConfig config,
+    DatasetBuffer datasetBuffer,
+    DatasetWriter datasetWriter,
+    DatasetRetentionService retentionService)
+
     {
         _logger = logger;
         _loggerFactory = loggerFactory;
         _config = config;
         _datasetBuffer = datasetBuffer;
         _datasetWriter = datasetWriter;
+        _retentionService = retentionService;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -65,62 +70,10 @@ public class Worker : BackgroundService
     private void LogStartupInformation()
     {
         _logger.LogInformation(
-            "Application: {ApplicationName}",
-            _config.ApplicationName);
-
-        _logger.LogInformation(
-            "System: {SystemName}",
-            _config.SystemName);
-
-        _logger.LogInformation(
-            "Dataset Folder: {Folder}",
-            _config.Storage.DatasetFolder);
-
-        _logger.LogInformation(
-            "Application Log Folder: {Folder}",
-            _config.Storage.ApplicationLogFolder);
-
-        _logger.LogInformation(
-            "Write Interval: {WriteIntervalSeconds} second(s)",
-            _config.Storage.WriteIntervalSeconds);
-
-        _logger.LogInformation(
-            "ADS: ConnectTimeout={ConnectTimeoutSeconds}s, ReadTimeout={ReadTimeoutSeconds}s, ReconnectInterval={ReconnectIntervalSeconds}s",
-            _config.Ads.ConnectTimeoutSeconds,
-            _config.Ads.ReadTimeoutSeconds,
-            _config.Ads.ReconnectIntervalSeconds);
-
-        _logger.LogInformation(
-            "Acquisition: DefaultPeriodicReadInterval={DefaultPeriodicReadIntervalSeconds}s",
-            _config.Acquisition.DefaultPeriodicReadIntervalSeconds);
-
-        _logger.LogInformation(
-            "Configured PLC count: {Count}",
-            _config.Plcs.Count);
-
-        foreach (var plc in _config.Plcs)
-        {
-            _logger.LogInformation(
-                "PLC: {Name}, AMS: {AmsNetId}, Port: {Port}, Enabled: {Enabled}, RetentionDays: {RetentionDays}",
-                plc.Name,
-                plc.AmsNetId,
-                plc.Port,
-                plc.Enabled,
-                plc.RetentionDays);
-
-            foreach (var parameter in plc.Parameters)
-            {
-                _logger.LogInformation(
-                    "Parameter: {Name}, Mode: {Mode}, Address: {Address}, Type: {Type}, ReadIntervalSeconds: {ReadIntervalSeconds}, Offset: {Offset}, ForceWriteIntervalSeconds: {ForceWriteIntervalSeconds}",
-                    parameter.Name,
-                    parameter.ReadMode,
-                    parameter.VarAddress,
-                    parameter.VarType ?? "default",
-                    GetReadIntervalSeconds(parameter),
-                    parameter.Offset ?? 0,
-                    GetForceWriteIntervalSeconds(plc, parameter));
-            }
-        }
+            "{ApplicationName} started. System='{SystemName}'. PLC count={PlcCount}.",
+            _config.ApplicationName,
+            _config.SystemName,
+            _config.Plcs.Count(p => p.Enabled));
     }
 
     private async Task RunPlcReconnectLoopAsync(
@@ -144,9 +97,9 @@ public class Worker : BackgroundService
                 MarkConnectionLost(
                     plc);
 
-                _logger.LogWarning(
+                _logger.LogDebug(
                     ex,
-                    "PLC '{PlcName}' session failed and will be restarted after {ReconnectIntervalSeconds} second(s).",
+                    "PLC '{PlcName}' session is still unavailable. Retry in {ReconnectIntervalSeconds} second(s).",
                     plc.Name,
                     _config.Ads.ReconnectIntervalSeconds);
             }
@@ -180,10 +133,6 @@ public class Worker : BackgroundService
                 e);
         };
 
-        _logger.LogInformation(
-            "Connecting to PLC '{PlcName}'...",
-            plc.Name);
-
         var connected =
             await plcManager.ConnectAsync(stoppingToken);
 
@@ -192,11 +141,6 @@ public class Worker : BackgroundService
             MarkConnectionLost(
                 plc);
 
-            _logger.LogWarning(
-                "ADS connection failed for PLC '{PlcName}'. Will retry after {ReconnectIntervalSeconds} second(s).",
-                plc.Name,
-                _config.Ads.ReconnectIntervalSeconds);
-
             return;
         }
 
@@ -204,6 +148,24 @@ public class Worker : BackgroundService
             plc,
             plcManager,
             stoppingToken);
+
+        try
+        {
+            await _retentionService.CleanupIfDueAsync(
+                plc.Name,
+                stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Dataset retention failed for PLC '{PlcName}'. PLC session will continue normally.",
+                plc.Name);
+        }
 
         MarkConnectionRestored(
             plc);
@@ -237,9 +199,6 @@ public class Worker : BackgroundService
             return;
         }
 
-        _logger.LogInformation(
-            "Verifying ADS communication for PLC '{PlcName}' by reading configured parameters...",
-            plc.Name);
 
         foreach (var parameter in plc.Parameters)
         {
@@ -253,9 +212,6 @@ public class Worker : BackgroundService
                 stoppingToken);
         }
 
-        _logger.LogInformation(
-            "ADS communication verified for PLC '{PlcName}'.",
-            plc.Name);
     }
 
     private void MarkConnectionLost(
@@ -277,17 +233,31 @@ public class Worker : BackgroundService
     }
 
     private void MarkConnectionRestored(
-        PlcConfig plc)
+    PlcConfig plc)
     {
         var key = plc.Name;
 
-        if (!_connectionLostState.TryGetValue(key, out var wasLost) ||
-            !wasLost)
+        if (!_connectionLostState.TryGetValue(key, out var wasLost))
+        {
+            _connectionLostState[key] = false;
+
+            _logger.LogInformation(
+                "PLC '{PlcName}' connected.",
+                plc.Name);
+
+            return;
+        }
+
+        if (!wasLost)
         {
             return;
         }
 
         _connectionLostState[key] = false;
+
+        _logger.LogInformation(
+            "PLC '{PlcName}' connection restored.",
+            plc.Name);
 
         EnqueueConnectionEvent(
             plc,
@@ -299,10 +269,7 @@ public class Worker : BackgroundService
         PlcConnectionManager plcManager,
         CancellationToken stoppingToken)
     {
-        _logger.LogInformation(
-            "Writing initial snapshots for PLC '{PlcName}'.",
-            plc.Name);
-
+       
         foreach (var parameter in plc.Parameters)
         {
             if (stoppingToken.IsCancellationRequested)
@@ -318,9 +285,6 @@ public class Worker : BackgroundService
                 stoppingToken);
         }
 
-        _logger.LogInformation(
-            "Initial snapshots completed for PLC '{PlcName}'.",
-            plc.Name);
     }
 
     private void RegisterOnChangeNotifications(
@@ -333,24 +297,13 @@ public class Worker : BackgroundService
 
         if (onChangeParameters.Count == 0)
         {
-            _logger.LogInformation(
-                "PLC '{PlcName}' has no OnChange parameters.",
-                plc.Name);
-
+           
             return;
         }
 
         foreach (var parameter in onChangeParameters)
         {
             plcManager.AddOnChangeNotification(parameter);
-
-            _logger.LogInformation(
-                "OnChange notification registered for PLC '{PlcName}', parameter '{ParameterName}', type {Type}, offset {Offset}, force interval {ForceWriteIntervalSeconds} second(s).",
-                plc.Name,
-                parameter.Name,
-                parameter.VarType ?? "default",
-                parameter.Offset ?? 0,
-                GetForceWriteIntervalSeconds(plc, parameter));
         }
     }
     private async Task RunParameterLoopAsync(
@@ -374,11 +327,6 @@ public class Worker : BackgroundService
         var nextHealthCheckUtc =
             nowUtc.AddSeconds(_config.Ads.ReconnectIntervalSeconds);
 
-        _logger.LogInformation(
-            "Started parameter loop for PLC '{PlcName}'. Periodic parameters: {PeriodicCount}, total parameters with force snapshot: {TotalCount}.",
-            plc.Name,
-            periodicParameters.Count,
-            allParameters.Count);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -555,11 +503,6 @@ public class Worker : BackgroundService
                 parameter,
                 value);
 
-            _logger.LogInformation(
-                "OnChange notification accepted from PLC '{PlcName}', parameter '{ParameterName}' = {Value}",
-                plc.Name,
-                parameter.Name,
-                value);
         }
         catch (Exception ex)
         {
@@ -731,16 +674,6 @@ public class Worker : BackgroundService
 
         _datasetBuffer.Enqueue(record);
 
-        if (reason == DatasetWriteReason.InitialSnapshot ||
-            reason == DatasetWriteReason.ForceWrite)
-        {
-            _logger.LogInformation(
-                "{Reason} enqueued for PLC '{PlcName}', parameter '{ParameterName}' = {Value}",
-                reason,
-                plc.Name,
-                parameter.Name,
-                value);
-        }
     }
 
     private void EnqueueConnectionEvent(
@@ -759,10 +692,20 @@ public class Worker : BackgroundService
 
         _datasetBuffer.Enqueue(record);
 
-        _logger.LogInformation(
-            "Connection event for PLC '{PlcName}': {Reason}",
-            plc.Name,
-            reason);
+        switch (reason)
+        {
+            case DatasetWriteReason.ConnectionRestored:
+                _logger.LogInformation(
+                    "PLC '{PlcName}' connected.",
+                    plc.Name);
+                break;
+
+            case DatasetWriteReason.ConnectionLost:
+                _logger.LogWarning(
+                    "PLC '{PlcName}' connection lost.",
+                    plc.Name);
+                break;
+        }
     }
 
     private void UpdateLastAcceptedValue(
@@ -860,9 +803,6 @@ public class Worker : BackgroundService
             writeIntervalSeconds = 10;
         }
 
-        _logger.LogInformation(
-            "DatasetWriter loop started. Write interval: {Seconds} second(s).",
-            writeIntervalSeconds);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -872,14 +812,6 @@ public class Worker : BackgroundService
                 {
                     var writtenRecords =
                         await _datasetWriter.WritePendingRecordsAsync(stoppingToken);
-
-                    if (writtenRecords > 0)
-                    {
-                        _logger.LogInformation(
-                            "DatasetWriter flushed {Count} record(s). Buffer count after write = {BufferCount}",
-                            writtenRecords,
-                            _datasetBuffer.Count);
-                    }
                 }
             }
             catch (OperationCanceledException)

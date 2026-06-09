@@ -50,10 +50,7 @@ public class DatasetRetentionService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(
-                ex,
-                "Dataset retention failed for PLC '{PlcName}'. Normal dataset writing will continue.",
-                plcName);
+            throw;
         }
     }
 
@@ -76,10 +73,6 @@ public class DatasetRetentionService
 
         if (!File.Exists(filePath))
         {
-            _logger.LogInformation(
-                "Dataset retention skipped for PLC '{PlcName}'. Dataset file does not exist yet.",
-                plcName);
-
             return;
         }
 
@@ -200,13 +193,9 @@ public class DatasetRetentionService
         }
 
         _logger.LogInformation(
-            "Dataset retention completed for PLC '{PlcName}'. RetentionDays={RetentionDays}, Total={TotalLines}, Kept={KeptLines}, Removed={RemovedLines}, InvalidKept={InvalidLines}.",
+            "Dataset retention completed for PLC '{PlcName}'. Removed {RemovedLines} record(s).",
             plcName,
-            retentionDays,
-            totalLines,
-            keptLines,
-            removedLines,
-            invalidLines);
+            removedLines);
     }
 
     private int GetRetentionDays(

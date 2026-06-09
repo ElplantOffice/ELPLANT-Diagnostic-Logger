@@ -58,19 +58,13 @@ public class PlcConnectionManager : IDisposable
 
             State = PlcConnectionState.Connected;
 
-            _logger.LogInformation(
-                "PLC '{PlcName}' connected. AMS={AmsNetId}, Port={Port}",
-                _config.Name,
-                _config.AmsNetId,
-                _config.Port);
-
             return true;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             State = PlcConnectionState.Disconnected;
 
-            _logger.LogWarning(
+            _logger.LogDebug(
                 "PLC '{PlcName}' connection timeout after {TimeoutSeconds} second(s).",
                 _config.Name,
                 _adsConfig.ConnectTimeoutSeconds);
@@ -83,8 +77,8 @@ public class PlcConnectionManager : IDisposable
         {
             State = PlcConnectionState.Disconnected;
 
-            _logger.LogWarning(
-                ex,
+            _logger.LogDebug(
+                 ex,
                 "PLC '{PlcName}' connection failed.",
                 _config.Name);
 
@@ -118,14 +112,6 @@ public class PlcConnectionManager : IDisposable
             dotNetType);
 
         _notificationHandles.Add(handle);
-
-        _logger.LogInformation(
-            "Registered OnChange notification for PLC '{PlcName}', parameter '{ParameterName}', type {Type}, offset {Offset}, handle {Handle}.",
-            _config.Name,
-            parameter.Name,
-            dotNetType.Name,
-            parameter.Offset ?? 0,
-            handle);
 
         return handle;
     }
@@ -318,14 +304,10 @@ public class PlcConnectionManager : IDisposable
                     {
                         _adsClient.DeleteDeviceNotification(handle);
 
-                        _logger.LogInformation(
-                            "Deleted ADS notification handle {Handle} for PLC '{PlcName}'.",
-                            handle,
-                            _config.Name);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(
+                        _logger.LogDebug(
                             ex,
                             "Failed to delete ADS notification handle {Handle} for PLC '{PlcName}'.",
                             handle,

@@ -28,7 +28,7 @@ public class Program
             .WriteTo.File(
                 path: Path.Combine(appConfig.Storage.ApplicationLogFolder, "ApplicationLog-.txt"),
                 rollingInterval: RollingInterval.Day,
-                retainedFileCountLimit: applicationLogRetentionDays,
+                retainedFileCountLimit: null,
                 shared: true)
             .CreateLogger();
 
@@ -38,6 +38,7 @@ public class Program
         builder.Services.AddSingleton(appConfig);
         builder.Services.AddSingleton<DatasetBuffer>();
         builder.Services.AddSingleton<DatasetRetentionService>();
+        builder.Services.AddSingleton<ApplicationLogRetentionService>();
         builder.Services.AddSingleton<DatasetWriter>();
 
         builder.Services.AddHostedService<Worker>();
@@ -49,27 +50,18 @@ public class Program
 
         var host = builder.Build();
 
+        using (var scope = host.Services.CreateScope())
+        {
+            var retentionService =
+                scope.ServiceProvider.GetRequiredService<ApplicationLogRetentionService>();
+
+            retentionService.Cleanup(
+                appConfig.Storage.ApplicationLogFolder,
+                applicationLogRetentionDays);
+        }
+
         try
         {
-            Log.Information(
-                "Starting {ApplicationName} for system {SystemName}.",
-                appConfig.ApplicationName,
-                appConfig.SystemName);
-
-            Log.Information(
-                "Application log retention calculated from PLC RetentionDays. Retention: {RetentionDays} day(s).",
-                applicationLogRetentionDays);
-
-            Log.Information(
-                "ADS defaults: ConnectTimeout={ConnectTimeoutSeconds}s, ReadTimeout={ReadTimeoutSeconds}s, ReconnectInterval={ReconnectIntervalSeconds}s.",
-                appConfig.Ads.ConnectTimeoutSeconds,
-                appConfig.Ads.ReadTimeoutSeconds,
-                appConfig.Ads.ReconnectIntervalSeconds);
-
-            Log.Information(
-                "Acquisition defaults: DefaultPeriodicReadInterval={DefaultPeriodicReadIntervalSeconds}s.",
-                appConfig.Acquisition.DefaultPeriodicReadIntervalSeconds);
-
             host.Run();
         }
         catch (Exception ex)
