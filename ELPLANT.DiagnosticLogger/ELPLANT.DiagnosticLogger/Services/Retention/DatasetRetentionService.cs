@@ -192,10 +192,13 @@ public class DatasetRetentionService
             throw;
         }
 
-        _logger.LogInformation(
-            "Dataset retention completed for PLC '{PlcName}'. Removed {RemovedLines} record(s).",
-            plcName,
-            removedLines);
+        if (removedLines > 0)
+        {
+            _logger.LogInformation(
+                "Dataset retention completed for PLC '{PlcName}'. Removed {RemovedLines} record(s).",
+                plcName,
+                removedLines);
+        }
     }
 
     private int GetRetentionDays(
