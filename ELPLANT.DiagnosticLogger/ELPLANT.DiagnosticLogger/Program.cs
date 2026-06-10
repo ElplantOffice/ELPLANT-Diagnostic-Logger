@@ -25,6 +25,8 @@ public class Program
 
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Information()
+            .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
+            .MinimumLevel.Override("Microsoft.Hosting.Lifetime", Serilog.Events.LogEventLevel.Warning)
             .WriteTo.File(
                 path: Path.Combine(appConfig.Storage.ApplicationLogFolder, "ApplicationLog-.txt"),
                 rollingInterval: RollingInterval.Day,

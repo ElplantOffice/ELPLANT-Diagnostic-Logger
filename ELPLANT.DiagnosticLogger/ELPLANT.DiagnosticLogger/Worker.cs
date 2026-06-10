@@ -395,7 +395,7 @@ public class Worker : BackgroundService
                     DateTime.UtcNow.AddSeconds(_config.Ads.ReconnectIntervalSeconds);
             }
 
-            await Task.Delay(50, stoppingToken);
+            await Task.Delay(1000, stoppingToken);
         }
     }
 
@@ -691,21 +691,6 @@ public class Worker : BackgroundService
         };
 
         _datasetBuffer.Enqueue(record);
-
-        switch (reason)
-        {
-            case DatasetWriteReason.ConnectionRestored:
-                _logger.LogInformation(
-                    "PLC '{PlcName}' connected.",
-                    plc.Name);
-                break;
-
-            case DatasetWriteReason.ConnectionLost:
-                _logger.LogWarning(
-                    "PLC '{PlcName}' connection lost.",
-                    plc.Name);
-                break;
-        }
     }
 
     private void UpdateLastAcceptedValue(

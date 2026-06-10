@@ -1,11 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Worker">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <UserSecretsId>dotnet-ELPLANT.DiagnosticLogger-935d95e1-74e1-4bcd-9c09-f3f64577e5d1</UserSecretsId>
-  </PropertyGroup>
+  <TargetFramework>net8.0</TargetFramework>
+  <Nullable>enable</Nullable>
+  <ImplicitUsings>enable</ImplicitUsings>
+</PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Beckhoff.TwinCAT.Ads" Version="7.0.172" />
